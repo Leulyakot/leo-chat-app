@@ -35,4 +35,4 @@ Realtime chat using GraphQL Live Queries, Next.js and NextAuth.js &mdash; [tutor
 
 \* `NEXT_PUBLIC_GRAFBASE_URL` is your production API endpoint. You can find this from the **Connect** modal in your [project dashboard](https://grafbase.com/dashboard).
 
-jdbc:databricks://<host>:443/default;httpPath=<path>;AuthMech=3;EnableBatchedInserts=1;BatchInsertSize=1000;supportManyParameters=1;
+`jdbc:databricks://<host>:443/default;httpPath=<path>;AuthMech=3;EnableBatchedInserts=1;BatchInsertSize=1000;supportManyParameters=1;`
