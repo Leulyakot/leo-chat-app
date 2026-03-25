@@ -1,0 +1,444 @@
+# Databricks notebook job
+# Generic MuleSoft -> Databricks loader
+# Serial execution, per-object run logging, watermark-driven incremental loads
+
+import json
+import time
+import uuid
+import requests
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, lit
+from delta.tables import DeltaTable
+
+spark = SparkSession.builder.getOrCreate()
+
+# =========================================================
+# ENVIRONMENT / RUNTIME CONFIG
+# Put all environment-specific values here
+# =========================================================
+CATALOG = "main"
+CONTROL_SCHEMA = "control"
+RAW_SCHEMA = "raw"
+
+MULE_BASE_URL = "https://your-mulesoft-host/api/salesforce/extract"
+MULE_CLIENT_ID_SECRET_SCOPE = "mulesoft"
+MULE_CLIENT_ID_SECRET_KEY = "client_id"
+MULE_CLIENT_SECRET_SECRET_SCOPE = "mulesoft"
+MULE_CLIENT_SECRET_SECRET_KEY = "client_secret"
+
+REQUEST_TIMEOUT_SECONDS = 180
+MAX_RETRIES = 3
+RETRY_SLEEP_SECONDS = 5
+DEFAULT_PAGE_SIZE = 10000
+DEFAULT_START_WATERMARK = "1900-01-01T00:00:00Z"
+
+JOB_LOG_TABLE = f"{CATALOG}.{CONTROL_SCHEMA}.mulesoft_salesforce_job_log"
+WATERMARK_TABLE = f"{CATALOG}.{CONTROL_SCHEMA}.mulesoft_salesforce_watermark"
+
+# Optional response keys if your MuleSoft contract differs
+RESPONSE_RECORDS_KEY = "records"
+RESPONSE_HAS_MORE_KEY = "hasMore"
+RESPONSE_NEXT_CURSOR_KEY = "nextCursor"
+
+# =========================================================
+# NOTEBOOK PARAMETERS
+# =========================================================
+dbutils.widgets.text("object_name", "")
+dbutils.widgets.text("page_size", str(DEFAULT_PAGE_SIZE))
+dbutils.widgets.text("run_id", "")
+
+OBJECT_FILTER = dbutils.widgets.get("object_name").strip()
+PAGE_SIZE = int(dbutils.widgets.get("page_size").strip() or str(DEFAULT_PAGE_SIZE))
+RUN_ID = dbutils.widgets.get("run_id").strip() or str(uuid.uuid4())
+
+# =========================================================
+# OBJECT CONFIG
+# Add objects here only. Easy to extend.
+# =========================================================
+OBJECT_CONFIGS = [
+    {
+        "object_name": "Account",
+        "target_table": f"{CATALOG}.{RAW_SCHEMA}.sf_account",
+        "watermark_column": "SystemModstamp",
+        "load_type": "incremental",
+        "write_mode": "overwrite",
+        "execution_order": 1,
+        "endpoint_path": "",
+        "request_params": {},
+        "primary_key": "Id"
+    },
+    {
+        "object_name": "Contact",
+        "target_table": f"{CATALOG}.{RAW_SCHEMA}.sf_contact",
+        "watermark_column": "SystemModstamp",
+        "load_type": "incremental",
+        "write_mode": "overwrite",
+        "execution_order": 2,
+        "endpoint_path": "",
+        "request_params": {},
+        "primary_key": "Id"
+    },
+    {
+        "object_name": "Opportunity",
+        "target_table": f"{CATALOG}.{RAW_SCHEMA}.sf_opportunity",
+        "watermark_column": "SystemModstamp",
+        "load_type": "incremental",
+        "write_mode": "overwrite",
+        "execution_order": 3,
+        "endpoint_path": "",
+        "request_params": {},
+        "primary_key": "Id"
+    }
+]
+
+# =========================================================
+# FILTER / ORDER
+# =========================================================
+if OBJECT_FILTER:
+    OBJECT_CONFIGS = [
+        x for x in OBJECT_CONFIGS
+        if x["object_name"].lower() == OBJECT_FILTER.lower()
+    ]
+    if not OBJECT_CONFIGS:
+        raise ValueError(f"No config found for object_name={OBJECT_FILTER}")
+
+OBJECT_CONFIGS = sorted(OBJECT_CONFIGS, key=lambda x: x.get("execution_order", 999999))
+
+# =========================================================
+# SECRETS
+# =========================================================
+MULE_CLIENT_ID = dbutils.secrets.get(
+    MULE_CLIENT_ID_SECRET_SCOPE,
+    MULE_CLIENT_ID_SECRET_KEY
+)
+MULE_CLIENT_SECRET = dbutils.secrets.get(
+    MULE_CLIENT_SECRET_SECRET_SCOPE,
+    MULE_CLIENT_SECRET_SECRET_KEY
+)
+
+# =========================================================
+# HELPERS
+# =========================================================
+def now_ts():
+    return spark.sql("select current_timestamp() as ts").collect()[0]["ts"]
+
+
+def sql_escape(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def get_headers() -> dict:
+    return {
+        "client_id": MULE_CLIENT_ID,
+        "client_secret": MULE_CLIENT_SECRET,
+        "Content-Type": "application/json"
+    }
+
+
+def get_endpoint_url(config: dict) -> str:
+    endpoint_path = config.get("endpoint_path", "").strip()
+    if endpoint_path:
+        return f"{MULE_BASE_URL.rstrip('/')}/{endpoint_path.lstrip('/')}"
+    return MULE_BASE_URL
+
+
+def get_watermark(object_name: str) -> str:
+    query = f"""
+        SELECT watermark_value
+        FROM {WATERMARK_TABLE}
+        WHERE object_name = '{sql_escape(object_name)}'
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """
+    rows = spark.sql(query).collect()
+    return rows[0]["watermark_value"] if rows else DEFAULT_START_WATERMARK
+
+
+def update_watermark(object_name: str, watermark_column: str, watermark_value: str) -> None:
+    source_df = spark.createDataFrame(
+        [(object_name, watermark_column, watermark_value)],
+        ["object_name", "watermark_column", "watermark_value"]
+    ).withColumn("updated_at", current_timestamp())
+
+    target = DeltaTable.forName(spark, WATERMARK_TABLE)
+
+    (
+        target.alias("t")
+        .merge(source_df.alias("s"), "t.object_name = s.object_name")
+        .whenMatchedUpdate(set={
+            "watermark_column": "s.watermark_column",
+            "watermark_value": "s.watermark_value",
+            "updated_at": "s.updated_at"
+        })
+        .whenNotMatchedInsert(values={
+            "object_name": "s.object_name",
+            "watermark_column": "s.watermark_column",
+            "watermark_value": "s.watermark_value",
+            "updated_at": "s.updated_at"
+        })
+        .execute()
+    )
+
+
+def insert_job_log(
+    run_id: str,
+    object_name: str,
+    target_table: str,
+    load_type: str,
+    status: str,
+    page_size: int,
+    pages_loaded: int,
+    row_count: int,
+    watermark_before: str,
+    watermark_after: str,
+    started_at,
+    ended_at,
+    error_message: str
+) -> None:
+    row = [(
+        run_id,
+        object_name,
+        target_table,
+        load_type,
+        status,
+        page_size,
+        pages_loaded,
+        row_count,
+        watermark_before,
+        watermark_after,
+        started_at,
+        ended_at,
+        error_message
+    )]
+
+    columns = [
+        "run_id",
+        "object_name",
+        "target_table",
+        "load_type",
+        "status",
+        "page_size",
+        "pages_loaded",
+        "row_count",
+        "watermark_before",
+        "watermark_after",
+        "started_at",
+        "ended_at",
+        "error_message"
+    ]
+
+    spark.createDataFrame(row, columns).write.mode("append").saveAsTable(JOB_LOG_TABLE)
+
+
+def call_mulesoft(
+    config: dict,
+    limit: int,
+    cursor: str = None,
+    watermark_column: str = None,
+    watermark_value: str = None
+) -> dict:
+    params = {
+        "object": config["object_name"],
+        "limit": limit
+    }
+
+    params.update(config.get("request_params", {}))
+
+    if cursor:
+        params["cursor"] = cursor
+
+    if watermark_column and watermark_value:
+        params["watermarkColumn"] = watermark_column
+        params["watermarkValue"] = watermark_value
+
+    url = get_endpoint_url(config)
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(
+                url=url,
+                headers=get_headers(),
+                params=params,
+                timeout=REQUEST_TIMEOUT_SECONDS
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_SLEEP_SECONDS)
+            else:
+                raise last_error
+
+
+def records_to_df(records: list, run_id: str):
+    json_rdd = spark.sparkContext.parallelize([json.dumps(x) for x in records])
+    return (
+        spark.read.json(json_rdd)
+        .withColumn("_ingested_at", current_timestamp())
+        .withColumn("_run_id", lit(run_id))
+    )
+
+
+def write_page(df, target_table: str, write_mode: str, is_first_page: bool) -> None:
+    writer = (
+        df.write
+        .format("delta")
+        .option("mergeSchema", "true")
+    )
+
+    if write_mode == "overwrite" and is_first_page:
+        writer.mode("overwrite").option("overwriteSchema", "true").saveAsTable(target_table)
+    else:
+        writer.mode("append").saveAsTable(target_table)
+
+
+def get_page_max_watermark(df, watermark_column: str):
+    if not watermark_column or watermark_column not in df.columns:
+        return None
+    value = df.selectExpr(f"max({watermark_column}) as max_wm").collect()[0]["max_wm"]
+    return str(value) if value is not None else None
+
+
+# =========================================================
+# CORE OBJECT LOAD
+# =========================================================
+def load_object(config: dict) -> dict:
+    object_name = config["object_name"]
+    target_table = config["target_table"]
+    load_type = config.get("load_type", "incremental")
+    watermark_column = config.get("watermark_column")
+    write_mode = config.get("write_mode", "overwrite")
+
+    started_at = now_ts()
+    ended_at = None
+    pages_loaded = 0
+    total_rows = 0
+    cursor = None
+    is_first_page = True
+
+    watermark_before = None
+    watermark_after = None
+    max_seen_watermark = None
+
+    try:
+        if load_type == "incremental":
+            watermark_before = get_watermark(object_name)
+
+        while True:
+            response_payload = call_mulesoft(
+                config=config,
+                limit=PAGE_SIZE,
+                cursor=cursor,
+                watermark_column=watermark_column if load_type == "incremental" else None,
+                watermark_value=watermark_before if load_type == "incremental" else None
+            )
+
+            records = response_payload.get(RESPONSE_RECORDS_KEY, [])
+            has_more = response_payload.get(RESPONSE_HAS_MORE_KEY, False)
+            next_cursor = response_payload.get(RESPONSE_NEXT_CURSOR_KEY)
+
+            if not records:
+                break
+
+            pages_loaded += 1
+            total_rows += len(records)
+
+            df = records_to_df(records, RUN_ID)
+            write_page(df, target_table, write_mode, is_first_page)
+
+            page_max_watermark = get_page_max_watermark(df, watermark_column)
+            if page_max_watermark and (
+                max_seen_watermark is None or page_max_watermark > max_seen_watermark
+            ):
+                max_seen_watermark = page_max_watermark
+
+            print(f"{object_name}: page {pages_loaded} loaded {len(records)} rows")
+
+            is_first_page = False
+
+            if not has_more:
+                break
+
+            cursor = next_cursor
+
+        if load_type == "incremental":
+            watermark_after = max_seen_watermark or watermark_before
+            if watermark_after:
+                update_watermark(object_name, watermark_column, watermark_after)
+
+        ended_at = now_ts()
+
+        insert_job_log(
+            run_id=RUN_ID,
+            object_name=object_name,
+            target_table=target_table,
+            load_type=load_type,
+            status="SUCCESS",
+            page_size=PAGE_SIZE,
+            pages_loaded=pages_loaded,
+            row_count=total_rows,
+            watermark_before=watermark_before,
+            watermark_after=watermark_after,
+            started_at=started_at,
+            ended_at=ended_at,
+            error_message=None
+        )
+
+        return {
+            "object_name": object_name,
+            "status": "SUCCESS",
+            "pages_loaded": pages_loaded,
+            "row_count": total_rows,
+            "watermark_before": watermark_before,
+            "watermark_after": watermark_after
+        }
+
+    except Exception as exc:
+        ended_at = now_ts()
+
+        insert_job_log(
+            run_id=RUN_ID,
+            object_name=object_name,
+            target_table=target_table,
+            load_type=load_type,
+            status="FAILED",
+            page_size=PAGE_SIZE,
+            pages_loaded=pages_loaded,
+            row_count=total_rows,
+            watermark_before=watermark_before,
+            watermark_after=watermark_after,
+            started_at=started_at,
+            ended_at=ended_at,
+            error_message=str(exc)
+        )
+
+        print(f"FAILED {object_name}: {exc}")
+
+        return {
+            "object_name": object_name,
+            "status": "FAILED",
+            "pages_loaded": pages_loaded,
+            "row_count": total_rows,
+            "error_message": str(exc)
+        }
+
+
+# =========================================================
+# MAIN - SERIAL EXECUTION
+# =========================================================
+results = []
+
+for object_config in OBJECT_CONFIGS:
+    results.append(load_object(object_config))
+
+failed_objects = [x["object_name"] for x in results if x["status"] != "SUCCESS"]
+
+print(json.dumps(results, indent=2))
+
+if failed_objects:
+    raise RuntimeError(f"Notebook job failed for objects: {failed_objects}")
+
+dbutils.notebook.exit(json.dumps(results))
