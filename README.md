@@ -36,3 +36,39 @@ Realtime chat using GraphQL Live Queries, Next.js and NextAuth.js &mdash; [tutor
 \* `NEXT_PUBLIC_GRAFBASE_URL` is your production API endpoint. You can find this from the **Connect** modal in your [project dashboard](https://grafbase.com/dashboard).
 
 `jdbc:databricks://<host>:443/default;httpPath=<path>;AuthMech=3;EnableBatchedInserts=1;BatchInsertSize=1000;supportManyParameters=1;`
+
+%dw 2.0
+output application/csv
+    separator     = "|",       // pipe as delimiter
+    quoteValues   = true,      // wrap every cell in quotes so embedded pipes are safe
+    encoding      = "UTF-8",   // explicit UTF-8 for S3 and Databricks compatibility
+    header        = true,      // first row is column names derived from payload keys
+    lineSeparator = "\n",      // Unix LF line endings expected by Databricks Auto Loader
+    escape        = '"'        // RFC-4180 quote escaping aligned with DWL 1 clean output
+
+---
+payload                        // clean JSON from DWL 1 passed straight to CSV writer
+
+
+%dw 2.0
+output application/json
+
+fun clean(v: Any): String =
+    (v default "") as String                // if value is null, default to empty string then cast to String
+    replace /<[^>]+>/   with " "           // find anything between < and > tags and replace with space
+    replace /&amp;/     with "&"           // find the literal text &amp; and replace with & symbol
+    replace /&nbsp;/    with " "           // find the literal text &nbsp; and replace with a space
+    replace /&quot;/    with '"'           // find the literal text &quot; and replace with a double quote
+    replace /\\/        with "\\\\"        // find any backslash and escape it by doubling it
+    replace /\r\n/      with " "           // find carriage return followed by newline and replace with space
+    replace /[\r\n\t]/  with " "           // find any lone carriage return, newline or tab and replace with space
+    replace /[ ]{2,}/   with " "           // find two or more consecutive spaces and collapse into one space
+    then trim($)                           // take the result and remove any leading or trailing spaces
+
+---
+payload map (r) ->                         // loop through each record in the Salesforce response array
+    r mapObject ((value, key) -> {         // loop through every key value pair in the current record
+        (key): if (value == null)        null          // if the field has no value write null as-is
+               else if (value is String) clean(value)  // if the field is text run it through the sanitiser
+               else                      value         // if the field is a number boolean or date leave it untouched
+    })
